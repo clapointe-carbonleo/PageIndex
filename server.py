@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import anthropic
@@ -52,7 +53,7 @@ async def index_document(
         tmp_path = tmp.name
 
     try:
-        doc_id = pi_client.index(tmp_path)
+        doc_id = await asyncio.to_thread(pi_client.index, tmp_path)
         return {"doc_id": doc_id, "filename": file.filename}
     finally:
         os.unlink(tmp_path)
@@ -63,13 +64,8 @@ class QueryRequest(BaseModel):
     question: str
 
 
-@app.post("/query")
-def query_document(
-    req: QueryRequest,
-    x_api_secret: str = Header(default=""),
-):
-    verify_secret(x_api_secret)
-    structure = pi_client.get_document_structure(req.doc_id)
+def _run_query(doc_id: str, question: str) -> str:
+    structure = pi_client.get_document_structure(doc_id)
 
     tools = [
         {
@@ -91,7 +87,7 @@ def query_document(
     messages = [
         {
             "role": "user",
-            "content": f"Document structure:\n{structure}\n\nQuestion: {req.question}",
+            "content": f"Document structure:\n{structure}\n\nQuestion: {question}",
         }
     ]
 
@@ -109,16 +105,15 @@ def query_document(
         )
 
         if response.stop_reason == "end_turn":
-            answer = next(
+            return next(
                 (b.text for b in response.content if hasattr(b, "text")), ""
             )
-            return {"answer": answer}
 
         if response.stop_reason == "tool_use":
             tool_results = []
             for block in response.content:
                 if block.type == "tool_use" and block.name == "get_page_content":
-                    content = pi_client.get_page_content(req.doc_id, block.input["pages"])
+                    content = pi_client.get_page_content(doc_id, block.input["pages"])
                     tool_results.append(
                         {"type": "tool_result", "tool_use_id": block.id, "content": content}
                     )
@@ -126,3 +121,13 @@ def query_document(
             messages.append({"role": "user", "content": tool_results})
 
     raise HTTPException(status_code=500, detail="Could not answer the question.")
+
+
+@app.post("/query")
+async def query_document(
+    req: QueryRequest,
+    x_api_secret: str = Header(default=""),
+):
+    verify_secret(x_api_secret)
+    answer = await asyncio.to_thread(_run_query, req.doc_id, req.question)
+    return {"answer": answer}
